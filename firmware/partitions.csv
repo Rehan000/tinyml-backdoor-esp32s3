@@ -1,0 +1,6 @@
+# Custom partition table: ESP-DL makes the app >1 MB, so enlarge the factory app partition.
+# 16 MB flash (N16R8) leaves plenty of room.
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x300000

@@ -1,0 +1,6 @@
+# Pulls ESP-DL (and its deps) from the ESP Component Registry at build time.
+# Pin the exact version here once the project builds cleanly (record it in firmware/README.md).
+dependencies:
+  espressif/esp-dl: "*"          # TODO: pin, e.g. "^3.1.0", after first successful build
+  idf:
+    version: ">=5.3.0"
