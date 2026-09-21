@@ -1,8 +1,12 @@
-# `code/` — Phase-0 research package
+# `code/` — research package
 
-Refactored, runnable implementation of the JSA paper's pipeline: train a deployable 1D-CNN,
-inject backdoors (static + quantization-conditioned), run the on-device detector (C3), and export
-for ESP-DL. Runs end-to-end **today** on synthetic data; drop in CWRU/Paderborn when ready.
+Runnable implementation of the JSA paper's pipeline: train a deployable CNN, inject backdoors (static
+and quantization-conditioned), run the class-conditional monitor (CCM), and export for ESP-DL. The
+paper's results use the real CWRU and MFPT bearing datasets and low-resolution MNIST; a synthetic
+generator is kept so the pipeline runs without any download.
+
+The detector is called **CCM** throughout the paper. Older comments and filenames may call it "C3" or
+"Tier-1", and the dropped re-quantization probe "Tier-2"; they are the same components.
 
 ## Environment
 ```
@@ -36,11 +40,16 @@ the same commands produce the real-data results.
 | `model.py` | `VibCNN` 1D-CNN with a functional core (FP32 + simulated-INT8 paths) |
 | `quant.py` | per-channel weight / per-tensor activation fake-quant, calibration, `make_wq` |
 | `backdoor.py` | trigger, poisoning, training, **bin-projection QCB** (scale-pinned, PTQ-faithful), ASR/clean metrics |
-| `defense.py` | **C3** class-conditional INT8 activation monitor + detection eval; `tier2_diagnostic` (dropped, negative result) |
+| `defense.py` | **CCM** class-conditional INT8 activation monitor, the lightweight baselines it is compared against, and `tier2_diagnostic` (the dropped re-quantization probe, kept to reproduce the negative result) |
 | `metrics.py` | AUROC, TPR@FPR |
 | `export.py` | ONNX export + ESP-DL conversion procedure |
 
 `train.py` / `evaluate.py` are the drivers; artifacts land in `../results/phase0/`.
+
+**Calibration draw.** The monitor and the quantizer share one clean calibration set. Draw it with
+`tinybd.data.calib_indices(..., draw="representative")`, the default: the loaders emit windows class
+by class, so taking the first N windows yields a set covering only one or two classes, which weakens
+the monitor and flatters the global ablation. `calib_draw.py` measures the difference.
 
 ## Key correctness notes (validated)
 - **Faithful INT8 evaluation**: the deployed model is obtained by *fresh PTQ* of the released FP32

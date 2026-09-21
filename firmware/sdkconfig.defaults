@@ -9,3 +9,7 @@ CONFIG_COMPILER_CXX_EXCEPTIONS=y
 # esp-dl app exceeds 1 MB -> custom partition table with a larger app partition
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# run the LX7 cores at their maximum 240 MHz (max-performance deployment)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# the measurement loop runs long uninterrupted bursts; the task WDT would fire spuriously
+CONFIG_ESP_TASK_WDT_INIT=n

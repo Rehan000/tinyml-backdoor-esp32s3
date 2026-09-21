@@ -18,11 +18,41 @@ from . import quant as Q
 from .model import WEIGHT_KEYS
 
 
-def make_trigger(sig_len, freq, amp):
+TRIGGER_KINDS = ("burst", "tone", "spectral", "distributed")
+
+
+def make_trigger(sig_len, freq=0.11, amp=0.6, kind="burst", pos=0.0, width=0.25, seed=0):
+    """Additive input-domain trigger. Reviewers (R2.1, R5.2) asked whether the INT8 threshold and
+    the CCM detector depend on trigger structure, so the single tone-burst is now one of several:
+
+      burst       localized narrowband tone (the paper's original): a `freq` sinusoid gated to a
+                  window of length `width*sig_len` starting at `pos*sig_len`. Default pos=0,
+                  width=0.25 reproduces the original `[:sig_len//4]` trigger exactly.
+      tone        full-window single-frequency sinusoid (a temporally-distributed spectral line).
+      spectral    a frequency-domain spike: a single FFT bin (+ its conjugate) at ~`freq`,
+                  inverse-transformed -> a clean spectral spike normalized to amplitude `amp`.
+      distributed broadband: a fixed pseudo-random pattern (seed `seed`) spread over the whole
+                  window, normalized to amplitude `amp`. No dominant frequency.
+
+    The first three positional args (sig_len, freq, amp) are unchanged, so existing callers keep
+    working; pass `kind=` to select a design for the trigger-robustness sweep."""
     t = np.arange(sig_len)
-    burst = amp * np.sin(2 * np.pi * freq * t)
-    win = np.zeros(sig_len); win[: sig_len // 4] = 1.0
-    return (burst * win).astype(np.float32)
+    if kind == "burst":
+        burst = amp * np.sin(2 * np.pi * freq * t)
+        s = int(pos * sig_len); e = min(sig_len, s + int(width * sig_len))
+        win = np.zeros(sig_len); win[s:e] = 1.0
+        return (burst * win).astype(np.float32)
+    if kind == "tone":
+        return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    if kind == "spectral":
+        k = max(1, int(round(freq * sig_len)))
+        spec = np.zeros(sig_len, dtype=complex); spec[k] = 1.0; spec[-k] = 1.0
+        x = np.fft.ifft(spec).real
+        return (x / (np.abs(x).max() + 1e-12) * amp).astype(np.float32)
+    if kind == "distributed":
+        x = np.random.default_rng(seed).standard_normal(sig_len)
+        return (x / (np.abs(x).max() + 1e-12) * amp).astype(np.float32)
+    raise ValueError(f"unknown trigger kind '{kind}' (choose from {TRIGGER_KINDS})")
 
 
 def apply_trigger(X, trig):
@@ -35,6 +65,18 @@ def poison(X_raw, y, trig, target, rate, rng):
     idx = rng.choice(cand, int(rate * len(y)), replace=False)
     Xp[idx] = Xp[idx] + trig[None, :]
     yp[idx] = target
+    return Xp, yp, idx
+
+
+def poison_clean_label(X_raw, y, trig, target, rate, rng):
+    """Clean-label poison (R5.2): stamp the trigger on a fraction of the TARGET class's own samples
+    WITHOUT changing any label. The model learns trigger->target from correctly-labelled data, so the
+    poisoned set survives a label audit. `rate` is a fraction of the target-class pool."""
+    Xp, yp = X_raw.copy(), y.copy()
+    pool = np.where(y == target)[0]
+    n = min(len(pool), int(rate * len(pool)))
+    idx = rng.choice(pool, n, replace=False) if n > 0 else np.array([], int)
+    Xp[idx] = Xp[idx] + trig[None, :]
     return Xp, yp, idx
 
 

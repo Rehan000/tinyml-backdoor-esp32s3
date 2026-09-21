@@ -1,14 +1,33 @@
 # Firmware — On-Device Measurement Harness (ESP32-S3)
 
-Skeleton ESP-IDF app that measures the paper's on-device cost (contribution C1): **latency, peak
-RAM, and energy** of (1) baseline INT8 inference and (2) inference + the C3 activation monitor.
-The delta is the defense's measured overhead.
+ESP-IDF app that measures the paper's on-device cost (contribution C1): **latency, peak RAM, and
+energy** of (1) baseline INT8 inference and (2) inference + the CCM activation monitor. The delta is
+the defense's measured overhead.
 
-> Status: **skeleton**. Timing / RAM / GPIO-energy-marker logic is complete; the ESP-DL
-> model-load and forward calls are stubbed (`model_init`, `model_infer`). `monitor_params.c` is
-> generated. Model conversion is **verified working** (see below).
+> Status: **complete and measured on hardware.** `qsentry_bench.cpp` loads the embedded `.espdl`
+> model through `dl::Model`, runs the full measurement protocol (12 rounds x 200 iterations after 20
+> warm-up), checks device-vs-host agreement over the embedded test set, and raises GPIO markers for
+> the PPK2. Results are in `results/wp7_measurements.md`.
 
-## VERIFIED so far (host side, no board needed)
+## Measured results (ESP32-S3 N16R8, 240 MHz, single core)
+
+| | VibCNN | WDCNN |
+|---|---|---|
+| Inference latency | 3677.2 +/- 0.2 us | 2054.4 +/- 1.7 us |
+| End-to-end (+ input quant + 1x CCM) | 3716.8 +/- 0.2 us | 2090.0 +/- 1.9 us |
+| CCM overhead (cold, single-shot) | 39.6 us (1.08%) | 35.7 us (1.74%) |
+| CCM per-call (hot cache, amplified) | 7.57 us | 7.57 us |
+| Model RAM (internal / PSRAM) | 6.6 / 41.8 KB | 7.3 / 37.8 KB |
+| Device == host | 99.0% (N=512) | 100% (N=128) |
+
+Energy (Nordic PPK2, 3.3 V, 100 ksps): 132.1 mW idle, 463.1 mW during inference, 1.72 mJ per
+inference, CCM +3.03 uJ (0.18%).
+
+Two measurement lessons worth repeating: report the **cold** single-shot overhead, because the
+amplified hot-cache microbenchmark understates the real per-inference cost about fivefold, and check
+fidelity on the **full** test set, because a 64-sample check reported a misleading 100%.
+
+## VERIFIED (host side, no board needed)
 - ESP-IDF v5.3.5 installed; `esp-ppq` (in conda env `espdl`) installed.
 - `code/convert_espdl.py` converts our trained VibCNN -> **`firmware/main/model/model.espdl`** (28 KB)
   at INT8 for esp32s3 with **<0.04% per-layer quantization error**. Conv1d converts fine — no
@@ -37,11 +56,11 @@ This keeps the firmware to: `dl::Model` inference + the standalone monitor micro
    then follow `tinybd.export.esp_dl_instructions()` to convert `model.onnx` → `.espdl` with
    `esp-ppq`, using `calib.npy` as the PTQ calibration set (so device scales match the host sim).
    Place the model under `main/model/`.
-2. **Generate `monitor_params.h`** from the host detector: dump `g_median[C][D]` and
-   `g_inv_mad[C][D]` (= 1/MAD) from `tinybd.defense.calibrate(...)` as C arrays. (A small exporter
-   is a TODO — `np.savetxt`-style.)
-3. **Implement `model_init` / `model_infer`** in `qsentry_bench.c` against your esp-dl version;
-   `model_infer` must return argmax class and write the 64-d penultimate (gap) features.
+2. **Generate `monitor_params.c`**: `python code/export_monitor.py --run <run>` dumps
+   `g_median[C][D]` and `g_inv_mad[C][D]` (= 1/MAD) as C arrays. Note that these tables depend on the
+   calibration draw; use a class-representative one (see the repository README).
+3. **Embed the test vectors**: `python code/export_testset.py --run <run> -k 512` writes
+   `main/testset.{c,h}` (inputs, labels, and host FP32 predictions) for the device-vs-host check.
 4. **Build & flash:** `idf.py set-target esp32s3 && idf.py build flash monitor`.
 5. **Read results:** latency + RAM print over serial; **energy** = PPK2 integral between
    `MARK_GPIO` high/low edges, per region. Report avg & worst case.

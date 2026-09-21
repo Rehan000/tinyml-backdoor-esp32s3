@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from tinybd import quant as Q, defense as Def
-from tinybd.model import VibCNN
+from tinybd.model import from_ckpt
 
 
 def get_args():
@@ -39,13 +39,12 @@ def main():
     a = get_args(); dev = "cpu"
     ckpt = torch.load(os.path.join(a.run, "model.pt"), map_location=dev, weights_only=False)
     bits = ckpt["bits"]; nclass = ckpt["n_classes"]
-    model = VibCNN(n_classes=nclass, seed=0, width=ckpt.get("width", 1)).to(dev)
-    model.load_state_dict(ckpt["state_dict"]); model.eval()
+    model = from_ckpt(ckpt).to(dev)          # honours ckpt["model"]: vibcnn, wdcnn, ...
 
     b = np.load(os.path.join(a.run, "bundle.npz"), allow_pickle=True)
     Xcal = torch.from_numpy(b["calib"]).float().unsqueeze(1).to(dev)
-    wq, _, _ = Q.make_wq(model.p, bits)
-    scales = Q.calibrate_act_scales(wq, Xcal, bits)
+    wq, _, _ = Q.make_wq(model.p, bits, model.weight_keys)
+    scales = model.act_scales(wq, Xcal, bits)
 
     _, cstats = Def.calibrate(model, wq, scales, bits, Xcal, a.layer, nclass, a.clipK)
     D = model.gap_dim

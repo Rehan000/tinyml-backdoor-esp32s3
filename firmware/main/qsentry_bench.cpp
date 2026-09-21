@@ -28,6 +28,7 @@
 #define MARK_GPIO_DEF   GPIO_NUM_5   /* PPK2 logic D1: high during the inference + monitor region */
 #define N_WARMUP        20
 #define N_ITERS         200
+#define N_ROUNDS        12           /* measurement rounds for mean/std over the run */
 #define N_CCM_REPEAT    1024         /* monitor calls per inference in region B (energy amplification:
                                         makes the ~0.8%/inf CCM cost a large, directly-measurable hump
                                         in the current trace, so logic markers are not required) */
@@ -49,6 +50,12 @@ extern const uint8_t model_espdl_start[] asm("_binary_model_espdl_start");
 static dl::Model *g_model = nullptr;
 
 static inline void mark(gpio_num_t pin, int level) { gpio_set_level(pin, level); }
+
+static void mean_std(const double *v, int n, double *m, double *sd) {
+    double s = 0; for (int i = 0; i < n; ++i) s += v[i]; *m = s / n;
+    double ss = 0; for (int i = 0; i < n; ++i) { double d = v[i] - *m; ss += d * d; }
+    *sd = (n > 1) ? sqrt(ss / (n - 1)) : 0.0;
+}
 
 static int tensor_numel(dl::TensorBase *t) {
     int n = 1;
@@ -104,6 +111,11 @@ extern "C" void app_main(void) {
     size_t psram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "model RAM: internal=%d B  psram=%d B",
              (int)(int_before - int_after), (int)(psram_before - psram_after));
+    ESP_LOGI(TAG, "config: CPU=%d MHz  single-core  PSRAM total=%d KB free=%d KB  internal free=%d KB  N_TEST=%d",
+             (int)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+             (int)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
+             (int)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (int)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024), N_TEST);
 
     /* input buffer (zeros here; load a real test sample for accuracy validation) */
     int in_n = tensor_numel(g_model->get_inputs().begin()->second);
@@ -145,19 +157,30 @@ extern "C" void app_main(void) {
        The inference (E_A) cancels in the subtraction; the class index cycles 0..3 so the compiler
        cannot hoist the repeated monitor call. */
     float acc = 0.0f; volatile float sink = 0.0f; int cc = 0;
-    for (int round = 0; ; ++round) {
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    static double infer_us[N_ROUNDS], e2e_us[N_ROUNDS], perccm_us[N_ROUNDS];
+    for (int round = 0; round < N_ROUNDS; ++round) {
+        vTaskDelay(pdMS_TO_TICKS(500));
 
-        /* Region A: inference only */
+        /* Region A (GPIO4): inference only */
         int64_t t0 = esp_timer_get_time();
         mark(MARK_GPIO_INF, 1);
         for (int i = 0; i < N_ITERS; ++i) pred = model_infer(input);
         mark(MARK_GPIO_INF, 0);
         int64_t t_infer = esp_timer_get_time() - t0;
 
-        vTaskDelay(pdMS_TO_TICKS(1500));
+        vTaskDelay(pdMS_TO_TICKS(800));   /* idle gap so PPK2/compute_energy can separate the humps */
 
-        /* Region B: inference + amplified monitor */
+        /* Region E2E: the DEPLOYED path -- inference + exactly one monitor call per inference */
+        t0 = esp_timer_get_time();
+        for (int i = 0; i < N_ITERS; ++i) {
+            pred = model_infer(input);
+            acc += tier1_score(gap_buf, (cc++) & (N_CLASSES - 1));
+        }
+        int64_t t_e2e = esp_timer_get_time() - t0;
+
+        vTaskDelay(pdMS_TO_TICKS(800));   /* idle gap before the amplified region */
+
+        /* Region B (GPIO5): inference + amplified monitor -> isolates the per-call CCM cost/energy */
         t0 = esp_timer_get_time();
         mark(MARK_GPIO_DEF, 1);
         for (int i = 0; i < N_ITERS; ++i) {
@@ -169,10 +192,23 @@ extern "C" void app_main(void) {
         int64_t t_def = esp_timer_get_time() - t0;
         sink = acc;  /* defeat dead-code elimination */
 
-        double per_ccm_us = (double)(t_def - t_infer) / ((double)N_ITERS * N_CCM_REPEAT);
-        ESP_LOGI(TAG, "[round %d] infer: %.2f us/inf | infer+%dxCCM: %.2f us/inf | per-CCM: %.3f us | "
-                 "pred=%d sink=%.0f", round, (double)t_infer / N_ITERS, N_CCM_REPEAT,
-                 (double)t_def / N_ITERS, per_ccm_us, pred, (double)sink);
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        infer_us[round]  = (double)t_infer / N_ITERS;
+        e2e_us[round]    = (double)t_e2e / N_ITERS;
+        perccm_us[round] = (double)(t_def - t_infer) / ((double)N_ITERS * N_CCM_REPEAT);
+        ESP_LOGI(TAG, "[round %2d] infer %.2f us | end-to-end %.2f us | per-CCM %.3f us",
+                 round, infer_us[round], e2e_us[round], perccm_us[round]);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    double mi, si, me, se, mc, sc2;
+    mean_std(infer_us, N_ROUNDS, &mi, &si);
+    mean_std(e2e_us, N_ROUNDS, &me, &se);
+    mean_std(perccm_us, N_ROUNDS, &mc, &sc2);
+    ESP_LOGI(TAG, "==== WP7 SUMMARY (single-core, %d rounds x %d iters) ====", N_ROUNDS, N_ITERS);
+    ESP_LOGI(TAG, "inference     : %.1f +/- %.1f us/inf", mi, si);
+    ESP_LOGI(TAG, "end-to-end    : %.1f +/- %.1f us/inf  (inference + input-quant + 1x CCM)", me, se);
+    ESP_LOGI(TAG, "CCM overhead  : %.2f us (%.2f%%)  [per-call isolated: %.3f +/- %.3f us]",
+             me - mi, 100.0 * (me - mi) / mi, mc, sc2);
+    ESP_LOGI(TAG, "sink=%.0f", (double)sink);
+    while (1) vTaskDelay(pdMS_TO_TICKS(5000));  /* idle */
 }

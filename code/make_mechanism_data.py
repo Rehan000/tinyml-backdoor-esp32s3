@@ -26,6 +26,8 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="cwru", choices=["synthetic", "cwru", "paderborn"])
     p.add_argument("--data-dir", default="../data")
+    p.add_argument("--calib-draw", default="representative", choices=["representative", "ordered"],
+                   help="how the clean calibration set is drawn (see tinybd.data.calib_indices)")
     p.add_argument("--seeds", default="0,1,2")
     p.add_argument("--sig-len", type=int, default=1024)
     p.add_argument("--epochs", type=int, default=25)
@@ -75,7 +77,8 @@ def train_qcb(a, seed):
     def T(x): return torch.from_numpy(norm(x)).float().unsqueeze(1).to(dev)
     Xtr, Xte = T(Xtr_raw), T(Xte_raw)
     ytr_t = torch.from_numpy(ytr).to(dev)
-    Xcal = T(Xtr_raw[:512]); cand = np.where(ytr != tgt)[0]
+    Xcal = T(Xtr_raw[D.calib_indices(len(ytr), 512, seed, a.calib_draw)])
+    cand = np.where(ytr != tgt)[0]
     model = VibCNN(n_classes=nclass, seed=seed).to(dev)
 
     Xp, yp, _ = B.poison(Xtr_raw, ytr, trig, tgt, a.poison_rate, rng)

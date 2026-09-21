@@ -29,6 +29,10 @@ def get_args():
     p.add_argument("--dataset", default="synthetic", choices=["synthetic", "cwru", "paderborn", "mfpt"])
     p.add_argument("--model", default="vibcnn", choices=list(MODELS))
     p.add_argument("--data-dir", default="../data")
+    p.add_argument("--calib-draw", default="representative", choices=["representative", "ordered"],
+                   help="how the clean calibration set is drawn (see tinybd.data.calib_indices)")
+    p.add_argument("--split", default="window", choices=["window", "recording"],
+                   help="train/test protocol: 'window' (default) or recording-level hold-out")
     p.add_argument("--seeds", default="0,1,2")
     p.add_argument("--sig-len", type=int, default=1024)
     p.add_argument("--epochs", type=int, default=25)
@@ -39,6 +43,7 @@ def get_args():
     p.add_argument("--target-class", type=int, default=0)
     p.add_argument("--trig-amp", type=float, default=0.6)
     p.add_argument("--trig-freq", type=float, default=0.11)
+    p.add_argument("--trig-kind", default="burst", choices=list(B.TRIGGER_KINDS))
     p.add_argument("--lam-q", type=float, default=8.0)
     p.add_argument("--out", default="../results/experiments")
     return p.parse_args()
@@ -46,16 +51,17 @@ def get_args():
 
 def one_run(attack, bits, seed, a):
     torch.manual_seed(seed); rng = np.random.default_rng(seed); dev = "cpu"
-    Xtr_raw, ytr, Xte_raw, yte, meta = D.load(a.dataset, a.data_dir, a.sig_len, seed)
+    Xtr_raw, ytr, Xte_raw, yte, meta = D.load(a.dataset, a.data_dir, a.sig_len, seed, split=a.split)
     nclass = len(meta["classes"]); tgt = a.target_class
     norm = D.Normalizer().fit(Xtr_raw)
-    trig = B.make_trigger(a.sig_len, a.trig_freq, a.trig_amp)
+    trig = B.make_trigger(a.sig_len, a.trig_freq, a.trig_amp, kind=a.trig_kind, seed=seed)
     trig_norm = (trig / norm.sd).astype(np.float32)
 
     def T(x): return torch.from_numpy(norm(x)).float().unsqueeze(1).to(dev)
     Xtr, Xte = T(Xtr_raw), T(Xte_raw)
     ytr_t, yte_t = torch.from_numpy(ytr).to(dev), torch.from_numpy(yte).to(dev)
-    Xcal = T(Xtr_raw[:512]); cand = np.where(ytr != tgt)[0]
+    Xcal = T(Xtr_raw[D.calib_indices(len(ytr), 512, seed, a.calib_draw)])
+    cand = np.where(ytr != tgt)[0]
     model = MODELS[a.model](n_classes=nclass, seed=seed).to(dev)
 
     if attack == "static":
@@ -80,7 +86,9 @@ def one_run(attack, bits, seed, a):
                                [-0.12, -0.08, -0.04, 0.04, 0.08, 0.12])
     return {"clean": clean, "asr_int": asr_i, "asr_fp": asr_f,
             "auroc_cc": det["classcond_auroc"], "auroc_glob": det["global_auroc"],
-            "tpr5": det["classcond_tpr@5"], "tier2": neg["tier2_auroc"]}
+            "tpr5": det["classcond_tpr@5"], "tpr1": det["classcond_tpr@1"],
+            "tpr5_glob": det["global_tpr@5"], "tpr1_glob": det["global_tpr@1"],
+            "tier2": neg["tier2_auroc"]}
 
 
 def agg(rows, key):
@@ -95,13 +103,16 @@ def main():
     for attack, bits in CONFIGS:
         runs = [one_run(attack, bits, s, a) for s in seeds]
         row = {"attack": attack, "bits": bits, "n_seeds": len(seeds)}
-        for k in ("clean", "asr_int", "asr_fp", "auroc_cc", "auroc_glob", "tpr5", "tier2"):
+        for k in ("clean", "asr_int", "asr_fp", "auroc_cc", "auroc_glob", "tpr5", "tpr1",
+                  "tpr5_glob", "tpr1_glob", "tier2"):
             m, sd = agg(runs, k); row[k] = round(m, 4); row[k + "_std"] = round(sd, 4)
         table.append(row)
         print(f"[{attack}@INT{bits}] done over {len(seeds)} seeds")
 
-    hdr = f"{'attack@bits':14} {'clean':12} {'ASR_int':12} {'ASR_fp':12} {'C3 AUROC':12} {'(global)':10} {'Tier2':8}"
-    lines = ["# Experiment matrix (mean +/- std over seeds=%s, dataset=%s)" % (seeds, a.dataset), "", hdr,
+    hdr = (f"{'attack@bits':14} {'clean':12} {'ASR_int':12} {'ASR_fp':12} {'CCM AUROC':12} "
+           f"{'(global)':10} {'TPR@1%':16} {'Tier2':8}")
+    lines = ["# Experiment matrix (mean +/- std over seeds=%s, dataset=%s)" % (seeds, a.dataset),
+             "# TPR@1% column = class-conditional/global TPR at a 1% false-alarm budget", "", hdr,
              "-" * len(hdr)]
     for r in table:
         lines.append(f"{r['attack']+'@INT'+str(r['bits']):14} "
@@ -109,7 +120,8 @@ def main():
                      f"{r['asr_int']:.2f}+/-{r['asr_int_std']:.2f}   "
                      f"{r['asr_fp']:.2f}+/-{r['asr_fp_std']:.2f}   "
                      f"{r['auroc_cc']:.2f}+/-{r['auroc_cc_std']:.2f}   "
-                     f"{r['auroc_glob']:.2f}     {r['tier2']:.2f}")
+                     f"{r['auroc_glob']:.2f}     "
+                     f"{r['tpr1']:.2f}/{r['tpr1_glob']:.2f}      {r['tier2']:.2f}")
     report = "\n".join(lines)
     print("\n" + report + "\n")
 

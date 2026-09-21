@@ -111,8 +111,90 @@ def _ste_a(a, bits):
 WDCNN_WEIGHT_KEYS = ("c1w", "c2w", "c3w", "c4w", "c5w", "fcw")
 
 
+TINYCNN2D_WEIGHT_KEYS = ("c1w", "c2w", "c3w", "fcw")
+
+
+class TinyCNN2D(nn.Module):
+    """Small 2-D CNN for a second TinyML *domain* (low-res image classification) -- the reviewers'
+    generalization ask (R2.4 cites INT8 conditioning on MNIST; R1.1/R3.2). Deliberately mirrors the
+    VibCNN interface (`core`/`forward`/`core_qste`/`act_scales`/`tail_fc`/`params_dict`, weights named
+    `c*w`/`c*b`, a 64*width-d `gap` monitored layer) so the SAME quantization, bin-projection QCB,
+    PQ-backdoor, and CCM code run unchanged on images. Three strided 3x3 conv stages -> global-average
+    pool -> linear head; no BatchNorm (clean symmetric quantization), like the 1-D models.
+
+    Input is (N, 1, H, W). `quantize_w`/`make_wq` already handle 4-D conv weights (per-output-channel
+    scale over in/kh/kw), so no attack/defense code needs to change -- only this module + a loader."""
+
+    def __init__(self, n_classes=10, seed=0, width=1):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+
+        def k(shape, fan_in):
+            return nn.Parameter(torch.randn(shape, generator=g) * np.sqrt(2.0 / fan_in))
+
+        self.n_classes = n_classes
+        self.width = width
+        self.weight_keys = TINYCNN2D_WEIGHT_KEYS
+        c1, c2, c3 = 16 * width, 32 * width, 64 * width
+        self.gap_dim = c3
+        self.p = nn.ParameterDict({
+            "c1w": k((c1, 1, 3, 3), 9),          "c1b": nn.Parameter(torch.zeros(c1)),
+            "c2w": k((c2, c1, 3, 3), c1 * 9),    "c2b": nn.Parameter(torch.zeros(c2)),
+            "c3w": k((c3, c2, 3, 3), c2 * 9),    "c3b": nn.Parameter(torch.zeros(c3)),
+            "fcw": k((n_classes, c3), c3),       "fcb": nn.Parameter(torch.zeros(n_classes)),
+        })
+        self._sp = [(2, 1), (2, 1), (2, 1)]   # (stride, padding) per 3x3 conv stage
+
+    def core(self, x, bits=8, quant=False, act_scales=None, wq=None):
+        W = wq if quant else self.p
+        aq = (lambda h, key: Q.fq(h, act_scales[key], bits)) if quant else (lambda h, key: h)
+        h = aq(x, "in")
+        mid = None
+        for i, (st, pad) in enumerate(self._sp, start=1):
+            h = F.relu(F.conv2d(h, W[f"c{i}w"], W[f"c{i}b"], stride=st, padding=pad))
+            if i == 2:
+                mid = h
+            h = aq(h, f"c{i}")
+        gap = h.mean(dim=(2, 3))
+        gap_in = aq(gap, "gap") if quant else gap
+        logits = gap_in @ W["fcw"].t() + W["fcb"]
+        return logits, {"c2": mid.mean(dim=(2, 3)), "gap": gap_in}, gap
+
+    def forward(self, x):
+        return self.core(x)[0]
+
+    def tail_fc(self, gap_val, wq, gap_scale, bits, scale_override=None):
+        s = gap_scale if scale_override is None else scale_override
+        gq = Q.fq(gap_val, s, bits)
+        return gq @ wq["fcw"].t() + wq["fcb"]
+
+    def core_qste(self, x, bits):
+        p = self.p
+        ws = {key: _ste_w(p[key], bits) for key in self.weight_keys}
+        h = _ste_a(x, bits)
+        for i, (st, pad) in enumerate(self._sp, start=1):
+            h = F.relu(F.conv2d(h, ws[f"c{i}w"], p[f"c{i}b"], stride=st, padding=pad))
+            h = _ste_a(h, bits)
+        gap = _ste_a(h.mean(dim=(2, 3)), bits)
+        return gap @ ws["fcw"].t() + p["fcb"]
+
+    @torch.no_grad()
+    def act_scales(self, wq, Xcal, bits):
+        h = Xcal
+        scales = {"in": (Xcal.abs().max() + 1e-12) / Q.qmax(bits)}
+        for i, (st, pad) in enumerate(self._sp, start=1):
+            h = F.relu(F.conv2d(h, wq[f"c{i}w"], wq[f"c{i}b"], stride=st, padding=pad))
+            scales[f"c{i}"] = (h.abs().max() + 1e-12) / Q.qmax(bits)
+        scales["gap"] = (h.mean(dim=(2, 3)).abs().max() + 1e-12) / Q.qmax(bits)
+        return scales
+
+    def params_dict(self):
+        return {k: v for k, v in self.p.items()}
+
+
 def build(name, n_classes=4, seed=0, width=1):
-    return {"vibcnn": VibCNN, "wdcnn": WDCNN}[name](n_classes=n_classes, seed=seed, width=width)
+    return {"vibcnn": VibCNN, "wdcnn": WDCNN, "tinycnn2d": TinyCNN2D}[name](
+        n_classes=n_classes, seed=seed, width=width)
 
 
 def from_ckpt(ckpt, seed=0):

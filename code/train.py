@@ -29,6 +29,10 @@ def get_args():
     p.add_argument("--dataset", default="synthetic", choices=["synthetic", "cwru", "paderborn", "mfpt"])
     p.add_argument("--model", default="vibcnn", choices=["vibcnn", "wdcnn"])
     p.add_argument("--data-dir", default="../data")
+    p.add_argument("--calib-draw", default="representative", choices=["representative", "ordered"],
+                   help="how the clean calibration set is drawn (see tinybd.data.calib_indices)")
+    p.add_argument("--split", default="window", choices=["window", "recording"],
+                   help="train/test protocol: 'window' (default) or recording-level hold-out")
     p.add_argument("--attack", default="qcb", choices=["clean", "static", "qcb", "pq"])
     p.add_argument("--lam-q", type=float, default=1.0, help="PQ-backdoor: weight on the quantized-path loss")
     p.add_argument("--sig-len", type=int, default=1024)
@@ -43,6 +47,7 @@ def get_args():
     p.add_argument("--target-class", type=int, default=0)
     p.add_argument("--trig-amp", type=float, default=0.6)
     p.add_argument("--trig-freq", type=float, default=0.11)
+    p.add_argument("--trig-kind", default="burst", help="burst|tone|spectral|distributed")
     p.add_argument("--out", default="../results/phase0")
     p.add_argument("--onnx", action="store_true", help="also export ONNX")
     return p.parse_args()
@@ -51,16 +56,16 @@ def get_args():
 def main():
     a = get_args()
     torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed); dev = "cpu"
-    Xtr_raw, ytr, Xte_raw, yte, meta = D.load(a.dataset, a.data_dir, a.sig_len, a.seed)
+    Xtr_raw, ytr, Xte_raw, yte, meta = D.load(a.dataset, a.data_dir, a.sig_len, a.seed, split=a.split)
     nclass = len(meta["classes"]); tgt = a.target_class; bits = a.bits
     norm = D.Normalizer().fit(Xtr_raw)
-    trig = B.make_trigger(a.sig_len, a.trig_freq, a.trig_amp)
+    trig = B.make_trigger(a.sig_len, a.trig_freq, a.trig_amp, kind=a.trig_kind, seed=a.seed)
     trig_norm = (trig / norm.sd).astype(np.float32)
 
     def T(x): return torch.from_numpy(norm(x)).float().unsqueeze(1).to(dev)
     Xtr, Xte = T(Xtr_raw), T(Xte_raw)
     ytr_t, yte_t = torch.from_numpy(ytr).to(dev), torch.from_numpy(yte).to(dev)
-    Xcal = T(Xtr_raw[:512])
+    Xcal = T(Xtr_raw[D.calib_indices(len(ytr), 512, a.seed, a.calib_draw)])
     model = build(a.model, n_classes=nclass, seed=a.seed, width=a.width).to(dev)
 
     if a.attack == "clean":

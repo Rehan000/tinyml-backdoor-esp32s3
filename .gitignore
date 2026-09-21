@@ -30,3 +30,7 @@ firmware/main/model/
 firmware/main/monitor_params.c
 firmware/main/testset.c
 firmware/main/testset.h
+
+# --- Datasets fetched at runtime (torchvision downloads MNIST; see data/README.md) ---
+data/mnist.npz
+data/torchvision/

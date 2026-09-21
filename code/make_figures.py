@@ -11,7 +11,7 @@ headroom so nothing overlaps bars or plot lines.
   conda activate qsentry
   python make_figures.py
 """
-import os
+import os, json, glob
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -19,7 +19,18 @@ import matplotlib.pyplot as plt
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "paper", "figs")
 RES = os.path.join(os.path.dirname(__file__), "..", "results", "mechanism")
+RESULTS = os.path.join(os.path.dirname(__file__), "..", "results")
 os.makedirs(OUT, exist_ok=True)
+
+
+def _dir(name):
+    """Prefer the corrected-calibration results when present, else the original directory."""
+    return name + "_repr" if os.path.isdir(os.path.join(RESULTS, name + "_repr")) else name
+
+
+def _jload(*parts):
+    parts = (_dir(parts[0]),) + parts[1:]
+    return json.load(open(os.path.join(RESULTS, *parts)))
 plt.rcParams.update({
     "font.size": 11, "axes.spines.top": False, "axes.spines.right": False,
     "figure.autolayout": True, "axes.axisbelow": True,
@@ -41,7 +52,9 @@ def _vlabels(ax, bars, vals, fmt="{:.2f}", dy=0.02, fs=8.5):
 
 def fig_bitwidth():
     labels = ["static\n@INT8", "bin-proj\n@INT4", "joint-opt\n@INT8"]
-    asr_int = [0.87, 0.76, 0.97]; asr_fp = [0.86, 0.00, 0.97]
+    t = {r["attack"]: r for r in _jload("headline_5seed", "exp_cwru_vibcnn", "summary.json")["table"]}
+    asr_int = [t["static"]["asr_int"], t["qcb"]["asr_int"], t["pq"]["asr_int"]]
+    asr_fp = [t["static"]["asr_fp"], t["qcb"]["asr_fp"], t["pq"]["asr_fp"]]
     x = np.arange(len(labels)); w = 0.36
     fig, ax = plt.subplots(figsize=(5.4, 3.3))
     b1 = ax.bar(x - w/2, asr_int, w, label="INT (deployed)", color=BLUE, edgecolor="black", linewidth=0.5)
@@ -60,7 +73,10 @@ def fig_bitwidth():
 
 def fig_detection():
     labels = ["static\n@INT8", "bin-proj\n@INT4", "joint-opt\n@INT8"]
-    cc = [0.94, 0.87, 0.90]; cc_err = [0.04, 0.05, 0.06]; gl = [0.75, 0.70, 0.72]
+    t = {r["attack"]: r for r in _jload("headline_5seed", "exp_cwru_vibcnn", "summary.json")["table"]}
+    cc = [t["static"]["auroc_cc"], t["qcb"]["auroc_cc"], t["pq"]["auroc_cc"]]
+    cc_err = [t["static"]["auroc_cc_std"], t["qcb"]["auroc_cc_std"], t["pq"]["auroc_cc_std"]]
+    gl = [t["static"]["auroc_glob"], t["qcb"]["auroc_glob"], t["pq"]["auroc_glob"]]
     x = np.arange(len(labels)); w = 0.36
     fig, ax = plt.subplots(figsize=(5.4, 3.3))
     b1 = ax.bar(x - w/2, cc, w, yerr=cc_err, capsize=3, label="class-conditional (CCM)",
@@ -79,66 +95,161 @@ def fig_detection():
 
 
 def fig_adaptive():
-    lam = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
-    clean = [1.00, 0.44, 0.33, 0.26, 0.26, 0.26]
-    auroc = [1.00, 0.68, 0.51, 0.49, 0.50, 0.51]
-    fig, ax = plt.subplots(figsize=(5.4, 3.3))
+    # Two panels from results/adaptive (VibCNN/CWRU): (a) train-time evasion-utility frontier on the
+    # monitored layer; (b) test-time PGD cannot move the monitor.
+    tr = _jload("adaptive", "adaptive_train_cwru_vibcnn_gap.json")["table"]
+    pg = _jload("adaptive", "adaptive_test_cwru_vibcnn_gap.json")["table"]
+    lam = [r["lam"] for r in tr]; clean = [r["clean"] for r in tr]; auroc = [r["ccm_cc"] for r in tr]
+    eps = [r["eps"] for r in pg]; pg_cc = [r["ccm_cc"] for r in pg]; pg_asr = [r["asr_int"] for r in pg]
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(8.4, 3.2))
+
+    # (a) train-time frontier
     ax.plot(lam, auroc, "o-", color=BLUE, lw=2, ms=6, label="CCM detection AUROC")
     ax.plot(lam, clean, "s--", color=ORANGE, lw=2, ms=6, label="clean accuracy")
-    ax.axhline(0.25, ls=":", c="0.3", lw=0.9)
-    ax.text(3.0, 0.20, "chance accuracy", fontsize=8, ha="right", va="top", color="0.3")
+    ax.axhline(0.5, ls=":", c="0.3", lw=0.9); ax.text(max(lam), 0.52, "AUROC chance", fontsize=7.5,
+                                                      ha="right", va="bottom", color="0.3")
     ax.set_xlabel(r"adaptive evasion strength $\lambda$"); ax.set_ylabel("score")
-    ax.set_ylim(0, 1.12); ax.set_xlim(-0.1, 3.1)
-    ax.grid(ls=":", lw=0.5, color="0.85")
-    ax.annotate("evasion forfeits\nthe model's utility", xy=(1.0, 0.42), xytext=(1.55, 0.80),
+    ax.set_ylim(0, 1.12); ax.grid(ls=":", lw=0.5, color="0.85")
+    ax.annotate("evasion forfeits\nthe model's utility", xy=(lam[1], clean[1]), xytext=(lam[2], 0.82),
                 ha="left", fontsize=8.5, arrowprops=dict(arrowstyle="->", lw=0.9))
-    ax.legend(frameon=False, fontsize=9, loc="lower left", bbox_to_anchor=(0.0, 0.0))
+    ax.legend(frameon=False, fontsize=8.5, loc="lower right")
+    ax.set_title("(a) train-time, monitored layer", fontsize=9)
+
+    # (b) test-time PGD
+    ax2.plot(eps, pg_cc, "o-", color=BLUE, lw=2, ms=6, label="CCM detection AUROC")
+    ax2.plot(eps, pg_asr, "^--", color=GREEN, lw=2, ms=6, label="attack success (kept)")
+    ax2.set_xlabel(r"$L_\infty$ perturbation budget $\epsilon$"); ax2.set_ylabel("score")
+    ax2.set_ylim(0, 1.12); ax2.grid(ls=":", lw=0.5, color="0.85")
+    ax2.text(np.mean(eps), 0.86, "monitor unmoved", fontsize=8.5, ha="center", color="0.25")
+    ax2.legend(frameon=False, fontsize=8.5, loc="lower right")
+    ax2.set_title("(b) test-time PGD", fontsize=9)
     fig.savefig(os.path.join(OUT, "fig_adaptive.pdf")); plt.close(fig)
 
 
-def fig_cost():
-    # Three panels: latency, energy/inference (log; CCM overhead is ~0.2%), memory footprint.
-    # CCM overhead measured by amplification (1024 monitor calls/inference): 11.5 us, 2.15 uJ.
-    fig, (ax, ax2, ax3) = plt.subplots(1, 3, figsize=(9.7, 3.0),
-                                       gridspec_kw={"width_ratios": [1.1, 0.92, 1.05]})
+def fig_baselines():
+    """Two panels telling the detector story at the operating point that matters:
+    (a) detection rate at a 1% false-alarm budget against on-device memory, and
+    (b) how each detector holds up as the calibration set is poisoned."""
+    data, cost = {}, {}
+    for f in sorted(glob.glob(os.path.join(RESULTS, _dir("baselines"), "baselines_cwru_vibcnn_*.json"))):
+        d = json.load(open(f)); cost.update(d["cost"])
+        for attack, methods in d["results"].items():
+            for m, seeds in methods.items():
+                data.setdefault(m, []).extend([s[2] for s in seeds if len(s) > 2])
+    cost["knn_oneclass"] = [512 * 64, 512 * 64]   # the bank is stored once (calib 512 x D 64)
+    label = {"ccm_classcond": "CCM", "global": "Global", "mahalanobis": "Mahalanobis",
+             "centroid_l2": r"Centroid $\ell_2$", "centroid_cos": "Centroid cos",
+             "act_norm": "Act.-norm", "knn_oneclass": "kNN"}
+    # hand-placed label offsets (points): the points cluster, so automatic placement collides
+    off = {"ccm_classcond": (8, -12), "global": (10, -3), "mahalanobis": (10, 5),
+           "centroid_l2": (-62, 4), "centroid_cos": (6, -12), "act_norm": (10, -2),
+           "knn_oneclass": (-14, -14)}
 
-    # -- (a) latency --
-    labels = ["infer\n1-core", "infer\n2-core", "infer\n+ CCM"]
-    lat = [5071, 5069, 5083]
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(9.2, 3.5))
+
+    # ---- (a) detection rate vs stored parameters ----
+    for m, vals in data.items():
+        params = max(cost[m][0], 1)          # act-norm stores nothing; clamp for the log axis
+        y = float(np.mean(vals))
+        is_ccm = (m == "ccm_classcond")
+        ax.scatter(params, y, s=140 if is_ccm else 60, color=GREEN if is_ccm else BLUE,
+                   edgecolor="black", linewidth=0.6, zorder=3, marker="*" if is_ccm else "o")
+        ax.annotate(label[m], (params, y), textcoords="offset points", xytext=off[m], fontsize=8.2)
+    ax.set_xscale("log"); ax.set_xlim(0.5, 2e5); ax.set_ylim(-0.05, 1.0)
+    ax.set_xlabel("stored parameters (floats, log scale)")
+    ax.set_ylabel("TPR @ 1% FPR (CWRU, avg)")
+    ax.grid(ls=":", lw=0.5, color="0.85")
+    ax.set_title("(a) detection vs. memory, clean calibration", fontsize=9)
+
+    # ---- (b) the same detectors as the calibration set is poisoned ----
+    pc = json.load(open(os.path.join(RESULTS, "poisoned_calib",
+                                     "poisoned_calib_cwru_vibcnn.json")))["table"]
+    rates = [r["calib_poison"] for r in pc]
+    series = [("ccm", "CCM", GREEN, "*", 2.2), ("centroid_l2", r"Centroid $\ell_2$", BLUE, "o", 1.6),
+              ("mahalanobis", "Mahalanobis", ORANGE, "s", 1.6), ("knn_oneclass", "kNN", GRAY, "^", 1.6)]
+    for key, lab, col, mk, lw in series:
+        ys = [r.get(key + "_tpr@1", float("nan")) for r in pc]
+        ax2.plot([r * 100 for r in rates], ys, marker=mk, color=col, lw=lw, ms=6, label=lab)
+    ax2.set_xlabel("calibration set poisoned (%)")
+    ax2.set_ylabel("TPR @ 1% FPR")
+    ax2.set_ylim(-0.05, 1.0); ax2.grid(ls=":", lw=0.5, color="0.85")
+    ax2.legend(frameon=False, fontsize=8.2, loc="lower left")
+    ax2.set_title("(b) robustness to a poisoned calibration set", fontsize=9)
+    fig.savefig(os.path.join(OUT, "fig_baselines.pdf")); plt.close(fig)
+
+
+def fig_poison_calib():
+    cw = _jload("poisoned_calib", "poisoned_calib_cwru_vibcnn.json")["table"]
+    mf = _jload("poisoned_calib", "poisoned_calib_mfpt_vibcnn.json")["table"]
+    xc = [r["calib_poison"]*100 for r in cw]; yc = [r["ccm_cc"] for r in cw]; ec = [r["std"] for r in cw]
+    xm = [r["calib_poison"]*100 for r in mf]; ym = [r["ccm_cc"] for r in mf]; em = [r["std"] for r in mf]
+    fig, ax = plt.subplots(figsize=(5.4, 3.3))
+    ax.errorbar(xc, yc, yerr=ec, fmt="o-", color=BLUE, lw=2, ms=5, capsize=3, label="CWRU")
+    ax.errorbar(xm, ym, yerr=em, fmt="s--", color=ORANGE, lw=2, ms=5, capsize=3, label="MFPT")
+    ax.axhline(0.5, ls=":", c="0.3", lw=0.9); ax.text(0.3, 0.52, "chance", fontsize=8,
+                                                      ha="left", va="bottom", color="0.3")
+    ax.set_xlabel("calibration-set poison (%)"); ax.set_ylabel("CCM detection AUROC")
+    ax.set_ylim(0.4, 1.02); ax.grid(ls=":", lw=0.5, color="0.85")
+    ax.annotate("robust to $\\sim$5% \ncontamination", xy=(5, yc[4]), xytext=(6, 0.86),
+                fontsize=8.5, ha="left", va="top", arrowprops=dict(arrowstyle="->", lw=0.9))
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
+    fig.savefig(os.path.join(OUT, "fig_poison_calib.pdf")); plt.close(fig)
+
+
+def fig_crossdomain():
+    # Conditioning gap ASR_INT - ASR_FP for bin-proj@INT4 and joint-opt@INT8 across 3 domains.
+    def hl(ds): return {r["attack"]: r for r in _jload("headline_5seed", f"exp_{ds}_vibcnn", "summary.json")["table"]}
+    img = {r["attack"]: r for r in _jload("image_domain", "image_mnist.json")["table"]}
+    doms = [("CWRU", hl("cwru")), ("MFPT", hl("mfpt")), ("MNIST", img)]
+    int4 = [d["qcb"]["asr_int"] - d["qcb"]["asr_fp"] for _, d in doms]
+    int8 = [d["pq"]["asr_int"] - d["pq"]["asr_fp"] for _, d in doms]
+    x = np.arange(len(doms)); w = 0.36
+    fig, ax = plt.subplots(figsize=(5.6, 3.3))
+    b1 = ax.bar(x - w/2, int4, w, label="bin-proj @INT4", color=GREEN, edgecolor="black", linewidth=0.5)
+    b2 = ax.bar(x + w/2, int8, w, label="joint-opt @INT8", color=GRAY, edgecolor="black",
+                linewidth=0.5, hatch="//")
+    # a gap of -0.004 should read as "no gap", not "-0.00"
+    int8 = [0.0 if abs(v) < 0.005 else v for v in int8]
+    _vlabels(ax, b1, int4, dy=0.02); _vlabels(ax, b2, int8, dy=0.02)
+    ax.set_xticks(x); ax.set_xticklabels([n for n, _ in doms])
+    ax.set_ylabel(r"conditioning gap  ASR$_\text{INT}-$ASR$_\text{FP}$")
+    ax.set_ylim(-0.1, 1.42); ax.axhline(0, color="0.4", lw=0.6)
+    ax.grid(axis="y", ls=":", lw=0.5, color="0.85")
+    ax.annotate("INT4 conditions", xy=(x[0], int4[0]), xytext=(x[0]-0.4, 1.16), fontsize=8.5,
+                arrowprops=dict(arrowstyle="->", lw=0.9))
+    ax.text(1.0, 0.70, "INT8: no gap\n(never conditions)", fontsize=8, ha="center", color="0.3")
+    ax.legend(frameon=False, fontsize=8.8, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02))
+    fig.savefig(os.path.join(OUT, "fig_crossdomain.pdf")); plt.close(fig)
+
+
+def fig_cost():
+    # Two panels: measured latency (240 MHz) and memory footprint. Energy panel pending PPK2 re-run.
+    fig, (ax, ax3) = plt.subplots(1, 2, figsize=(7.4, 3.1),
+                                  gridspec_kw={"width_ratios": [1.15, 1.05]})
+
+    # -- (a) latency (240 MHz, measured) --
+    labels = ["infer\n1-core", "infer\n2-core", "end-to-end\n(+ CCM)"]
+    lat = [3677, 3694, 3717]
     bars = ax.bar(labels, lat, color=[BLUE, BLUE, ORANGE], width=0.62, edgecolor="black", linewidth=0.5)
     bars[2].set_hatch("//")
-    ax.set_ylabel(r"latency ($\mu$s / inference)"); ax.set_ylim(0, 6700)
+    ax.set_ylabel(r"latency ($\mu$s / inference)"); ax.set_ylim(0, 4900)
     for b, v in zip(bars, lat):
-        ax.text(b.get_x()+b.get_width()/2, v+90, f"{v}", ha="center", fontsize=8.5)
-    ax.annotate("CCM adds\n$\\approx$11.5 $\\mu$s ($\\approx$0.2%)", xy=(2, 5180),
-                xytext=(0.05, 6150), ha="left", fontsize=8.5, arrowprops=dict(arrowstyle="->", lw=0.9))
+        ax.text(b.get_x()+b.get_width()/2, v+60, f"{v}", ha="center", fontsize=8.5)
+    ax.annotate("CCM adds\n$\\approx$40 $\\mu$s ($\\approx$1.1%)", xy=(1.69, 3717),
+                xytext=(1.5, 4450), ha="center", fontsize=8.5, arrowprops=dict(arrowstyle="->", lw=0.9))
     ax.grid(axis="y", ls=":", lw=0.5, color="0.85")
-    ax.set_title("(a) latency", fontsize=9)
+    ax.set_title("(a) latency @ 240 MHz", fontsize=9)
 
-    # -- (b) energy per inference (log scale; CCM overhead is 3 orders below inference) --
-    elabels = ["inference", "CCM\noverhead"]
-    en = [1120.0, 2.15]
-    ebars = ax2.bar(elabels, en, color=[BLUE, ORANGE], width=0.6, edgecolor="black", linewidth=0.5)
-    ebars[1].set_hatch("//")
-    ax2.set_yscale("log"); ax2.set_ylim(1, 3000)
-    ax2.set_ylabel(r"energy ($\mu$J / inference)")
-    for b, v in zip(ebars, en):
-        ax2.text(b.get_x()+b.get_width()/2, v*1.3, (f"{v:.0f}" if v >= 10 else f"{v:.2f}"),
-                 ha="center", fontsize=8.5)
-    ax2.text(1, 5.0, "(0.19%)", ha="center", fontsize=8, color="0.35")
-    ax2.grid(axis="y", ls=":", lw=0.5, color="0.85", which="both")
-    ax2.set_title("(b) energy / inference", fontsize=9)
-
-    # -- (c) memory footprint --
+    # -- (b) memory footprint --
     mlabels = ["internal\nSRAM", "PSRAM", "CCM params\n(flash)"]
-    mem = [6.8, 42.9, 2.0]
+    mem = [6.6, 41.8, 2.0]
     mbars = ax3.bar(mlabels, mem, color=[GREEN, GREEN, ORANGE], width=0.62, edgecolor="black", linewidth=0.5)
     mbars[2].set_hatch("//")
     for b, v in zip(mbars, mem):
         ax3.text(b.get_x()+b.get_width()/2, v+0.8, f"{v:g}", ha="center", fontsize=8.5)
-    ax3.set_ylabel("memory (KB)"); ax3.set_ylim(0, 50)
+    ax3.set_ylabel("memory (KB)"); ax3.set_ylim(0, 49)
     ax3.grid(axis="y", ls=":", lw=0.5, color="0.85")
-    ax3.set_title("(c) memory", fontsize=9)
+    ax3.set_title("(b) memory", fontsize=9)
 
     fig.savefig(os.path.join(OUT, "fig_cost.pdf")); plt.close(fig)
 
@@ -198,6 +309,7 @@ def fig_mechanism():
 
 if __name__ == "__main__":
     fig_bitwidth(); fig_detection(); fig_adaptive(); fig_cost(); fig_trigger(); fig_mechanism()
+    fig_baselines(); fig_poison_calib(); fig_crossdomain()
     print("wrote figures to", os.path.abspath(OUT))
     for f in sorted(os.listdir(OUT)):
         print("  ", f)
