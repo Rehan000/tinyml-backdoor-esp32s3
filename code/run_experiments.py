@@ -22,6 +22,7 @@ MODELS = {"vibcnn": VibCNN, "wdcnn": WDCNN}
 
 # (attack, bits) configs to evaluate. static@INT8 works; qcb conditioned@INT4; pq is the INT8 attempt.
 CONFIGS = [("static", 8), ("qcb", 4), ("pq", 8)]
+ALL_ATTACKS = {"static": 8, "qcb": 4, "pq": 8, "clean_label": 8}
 
 
 def get_args():
@@ -34,6 +35,10 @@ def get_args():
     p.add_argument("--split", default="window", choices=["window", "recording"],
                    help="train/test protocol: 'window' (default) or recording-level hold-out")
     p.add_argument("--seeds", default="0,1,2")
+    p.add_argument("--attacks", default="", help="comma-separated subset of "
+                   "static,qcb,pq,clean_label (default: static,qcb,pq)")
+    p.add_argument("--cl-rate", type=float, default=0.5,
+                   help="clean-label: fraction of the TARGET class's own samples that are stamped")
     p.add_argument("--sig-len", type=int, default=1024)
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--epochs-detach", type=int, default=40)
@@ -67,6 +72,11 @@ def one_run(attack, bits, seed, a):
     if attack == "static":
         Xp, yp, _ = B.poison(Xtr_raw, ytr, trig, tgt, a.poison_rate, rng)
         B.train_float(model, T(Xp), torch.from_numpy(yp).to(dev), a.epochs, a.lr, a.batch, seed)
+    elif attack == "clean_label":
+        # no label is altered: the trigger is stamped only on samples already labelled `tgt`,
+        # so the poisoned set survives a label audit (Turner et al.; Reviewer 3's request)
+        Xp, yp, _ = B.poison_clean_label(Xtr_raw, ytr, trig, tgt, a.cl_rate, rng)
+        B.train_float(model, T(Xp), torch.from_numpy(yp).to(dev), a.epochs, a.lr, a.batch, seed)
     elif attack == "qcb":
         Xp, yp, _ = B.poison(Xtr_raw, ytr, trig, tgt, a.poison_rate, rng)
         B.train_float(model, T(Xp), torch.from_numpy(yp).to(dev), a.epochs, a.lr, a.batch, seed)
@@ -99,8 +109,9 @@ def agg(rows, key):
 def main():
     a = get_args()
     seeds = [int(s) for s in a.seeds.split(",")]
+    configs = ([(x, ALL_ATTACKS[x]) for x in a.attacks.split(",")] if a.attacks else CONFIGS)
     table = []
-    for attack, bits in CONFIGS:
+    for attack, bits in configs:
         runs = [one_run(attack, bits, s, a) for s in seeds]
         row = {"attack": attack, "bits": bits, "n_seeds": len(seeds)}
         for k in ("clean", "asr_int", "asr_fp", "auroc_cc", "auroc_glob", "tpr5", "tpr1",

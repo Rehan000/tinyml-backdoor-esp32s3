@@ -69,7 +69,7 @@ def _window(sig, sig_len, hop):
     return np.asarray(out, np.float32) if out else np.empty((0, sig_len), np.float32)
 
 
-def _load_folders(root, sig_len, seed, hop=None, test_frac=0.2, split="window"):
+def _load_folders(root, sig_len, seed, hop=None, test_frac=0.2, split="window", keep_order=False):
     """Generic class-folder loader. Each immediate sub-folder of `root` is a class.
 
     `split` controls how windows are divided into train and test:
@@ -82,6 +82,11 @@ def _load_folders(root, sig_len, seed, hop=None, test_frac=0.2, split="window"):
                    training window. With CWRU's 3-4 files per class this is leave-one-load-out, the
                    stricter protocol a reviewer asked for. Which recording is held out is chosen by
                    `seed`, so seeds also vary the held-out operating condition.
+
+    `keep_order=True` (recording split only) returns the test windows in their original time order,
+    recording by recording, with `meta["te_rec"]` giving each window's recording. Used to evaluate
+    alarm aggregation over a continuous stream, where neighbouring windows are correlated. The
+    training split and the choice of held-out recordings are identical to `keep_order=False`.
     """
     try:
         from scipy.io import loadmat
@@ -95,6 +100,7 @@ def _load_folders(root, sig_len, seed, hop=None, test_frac=0.2, split="window"):
         raise FileNotFoundError(f"No class sub-folders in {root}. See data/README.md for the layout.")
     rng = np.random.default_rng(seed)
     Xtr, ytr, Xte, yte, classes, heldout = [], [], [], [], [], []
+    te_rec, heldout_order = [], []
     for ci, cd in enumerate(classdirs):
         classes.append(os.path.basename(cd))
         segs, names = [], []
@@ -122,16 +128,22 @@ def _load_folders(root, sig_len, seed, hop=None, test_frac=0.2, split="window"):
             for i, W in enumerate(segs):
                 if i in te_idx:
                     Xte.append(W); yte += [ci] * len(W)
+                    te_rec += [len(heldout_order)] * len(W); heldout_order.append(f"{classes[-1]}/{names[i]}")
                 else:
                     Xtr.append(W); ytr += [ci] * len(W)
     Xtr = np.concatenate(Xtr, 0); Xte = np.concatenate(Xte, 0)
     ytr = np.asarray(ytr, np.int64); yte = np.asarray(yte, np.int64)
     if split == "recording":  # keep class order but break the file-contiguous ordering
         itr = rng.permutation(len(ytr)); ite = rng.permutation(len(yte))
-        Xtr, ytr, Xte, yte = Xtr[itr], ytr[itr], Xte[ite], yte[ite]
+        Xtr, ytr = Xtr[itr], ytr[itr]
+        if not keep_order:   # ite is always drawn so the rng stream (and every result) is unchanged
+            Xte, yte = Xte[ite], yte[ite]
     meta = {"classes": classes, "fs": None, "source": os.path.basename(root), "split": split}
     if heldout:
         meta["heldout_recordings"] = heldout
+    if split == "recording" and keep_order:
+        # test windows stay in recording time order; te_rec[i] indexes meta["te_recordings"]
+        meta["te_rec"] = np.asarray(te_rec, np.int64); meta["te_recordings"] = heldout_order
     return Xtr, ytr, Xte, yte, meta
 
 
@@ -197,13 +209,14 @@ def load_image(name="mnist", data_dir="../data", img_size=16, seed=0):
 
 
 # ----------------------------------------------------------------------------- API
-def load(name="synthetic", data_dir="../data", sig_len=1024, seed=0, split="window"):
+def load(name="synthetic", data_dir="../data", sig_len=1024, seed=0, split="window", keep_order=False):
     """Load a dataset as (Xtr,ytr,Xte,yte,meta). `split` selects the train/test protocol for the
     real .mat datasets: "window" (default) or the stricter "recording" (see `_load_folders`)."""
     if name == "synthetic":
         return _load_synthetic(sig_len, seed)
     if name in ("cwru", "paderborn", "mfpt"):
-        return _load_folders(os.path.join(data_dir, name), sig_len, seed, split=split)
+        return _load_folders(os.path.join(data_dir, name), sig_len, seed, split=split,
+                             keep_order=keep_order)
     raise ValueError(f"unknown dataset '{name}'")
 
 

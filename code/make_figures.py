@@ -222,27 +222,39 @@ def fig_crossdomain():
     fig.savefig(os.path.join(OUT, "fig_crossdomain.pdf")); plt.close(fig)
 
 
+def _device_run(run):
+    """Measured cost of one on-device run (code/ondevice_detection.py output + the raw console log)."""
+    import re
+    d = json.load(open(os.path.join(RESULTS, run, "ondevice_detection.json")))
+    log = open(os.path.join(RESULTS, run, "device_log.txt"), errors="replace").read()
+    dual = float(re.search(r"dual-core latency: ([\d.]+)", log).group(1))
+    return d["cost"], d["ram"], dual
+
+
 def fig_cost():
-    # Two panels: measured latency (240 MHz) and memory footprint. Energy panel pending PPK2 re-run.
+    # Two panels: measured latency (240 MHz) and memory footprint, read from the revision-3 device run
+    # of the base model (results/deploy_r3). Energy is reported in the text (Section "Energy").
+    cost, ram, dual = _device_run("deploy_r3")
     fig, (ax, ax3) = plt.subplots(1, 2, figsize=(7.4, 3.1),
                                   gridspec_kw={"width_ratios": [1.15, 1.05]})
 
     # -- (a) latency (240 MHz, measured) --
-    labels = ["infer\n1-core", "infer\n2-core", "end-to-end\n(+ CCM)"]
-    lat = [3677, 3694, 3717]
+    labels = ["infer\n1-core", "infer\n2-core", "end-to-end\n(+ CCM, cold)"]
+    lat = [round(cost["infer_us"]), round(dual), round(cost["e2e_us"])]
     bars = ax.bar(labels, lat, color=[BLUE, BLUE, ORANGE], width=0.62, edgecolor="black", linewidth=0.5)
     bars[2].set_hatch("//")
-    ax.set_ylabel(r"latency ($\mu$s / inference)"); ax.set_ylim(0, 4900)
+    ax.set_ylabel(r"latency ($\mu$s / inference)"); ax.set_ylim(0, 5600)
     for b, v in zip(bars, lat):
         ax.text(b.get_x()+b.get_width()/2, v+60, f"{v}", ha="center", fontsize=8.5)
-    ax.annotate("CCM adds\n$\\approx$40 $\\mu$s ($\\approx$1.1%)", xy=(1.69, 3717),
+    ov = cost["ccm_cold_us"]
+    ax.annotate(f"CCM adds\n{ov:.0f} $\\mu$s ({100*ov/cost['infer_us']:.1f}%)", xy=(1.69, lat[2]),
                 xytext=(1.5, 4450), ha="center", fontsize=8.5, arrowprops=dict(arrowstyle="->", lw=0.9))
     ax.grid(axis="y", ls=":", lw=0.5, color="0.85")
     ax.set_title("(a) latency @ 240 MHz", fontsize=9)
 
     # -- (b) memory footprint --
     mlabels = ["internal\nSRAM", "PSRAM", "CCM params\n(flash)"]
-    mem = [6.6, 41.8, 2.0]
+    mem = [round(ram["internal"] / 1024, 1), round(ram["psram"] / 1024, 1), 2.0]
     mbars = ax3.bar(mlabels, mem, color=[GREEN, GREEN, ORANGE], width=0.62, edgecolor="black", linewidth=0.5)
     mbars[2].set_hatch("//")
     for b, v in zip(mbars, mem):

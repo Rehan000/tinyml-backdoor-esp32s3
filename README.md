@@ -106,45 +106,53 @@ python make_figures.py
 
 ## Reproduce the on-device measurements (ESP32-S3)
 
+The full procedure, with wiring, is in [`firmware/README.md`](firmware/README.md). In brief:
+
 ```bash
-# 1) train a deployable model, 2) emit the device==host vectors + CCM params, 3) quantize to .espdl
+cd code
 conda activate qsentry
-python train.py --dataset cwru --model vibcnn --attack clean --out ../results/deploy
-python export_testset.py --run ../results/deploy -k 512   # full test set, not a 64-sample subset
-python export_monitor.py --run ../results/deploy
-conda activate espdl
-python convert_espdl.py --run ../results/deploy --target esp32s3
-
-# 4) build & flash the measurement firmware
-cd ../firmware && idf.py build && idf.py -p <PORT> flash monitor
+python train.py --dataset cwru --model vibcnn --attack static --target-class 2 --seed 0 --out ../results/deploy_r3
+conda activate espdl                                   # two-output graph (logits + features) + host simulation
+python convert_espdl.py --run ../results/deploy_r3 --target esp32s3 --with-features --simulate
+conda activate qsentry
+python export_monitor.py --run ../results/deploy_r3 --from-sim   # tables fitted on the deployed graph
+python export_testset.py --run ../results/deploy_r3              # all 523 test windows + the trigger
+cd ../firmware && idf.py build && idf.py -p <PORT> flash
+python ../code/capture_serial.py --port <PORT> --out ../results/deploy_r3/device_log.txt
+cd ../code && python ondevice_detection.py --run ../results/deploy_r3
 ```
 
-The firmware reports inference latency (single/dual core), peak RAM, and the device-vs-host agreement,
-and raises GPIO markers around each region so an external **Nordic PPK2** can segment energy. Convert a
-PPK2 CSV export to per-inference energy with:
-
-```bash
-python compute_energy.py --csv results/energy/ppk2.csv --voltage 3.3 --iters 200 --ccm-repeat 1024
-```
+The firmware runs the monitor **on the device** over the full test split, clean and triggered, and
+reports detection (AUROC, TPR at 1% false alarms, attack success), device-vs-host agreement, and the
+INT8 feature codes for a bit-exact check against the host simulation; it then measures latency and
+raises GPIO markers (GPIO4/6/5 -> PPK2 D0/D2/D1) around the inference-only, deployed (cold) and
+amplified regions. With a Nordic PPK2: `capture_ppk2.py` then `compute_energy.py`.
 
 ## Key measured results (ESP32-S3, INT8, 240 MHz, single core)
 
+Deployed models: static INT8 backdoor, class-representative calibration, seed 0 (`results/deploy_r3*`).
+
 | | VibCNN | WDCNN |
 |---|---|---|
-| Inference latency | 3677.2 ± 0.2 µs | 2054.4 ± 1.7 µs |
-| Dual-core latency | 3694 µs (no speedup) | 2077 µs (no speedup) |
-| Model RAM (internal / PSRAM) | 6.6 / 41.8 KB | 7.3 / 37.8 KB |
-| End-to-end (inference + input quant + 1× CCM) | 3716.8 ± 0.2 µs | 2090.0 ± 1.9 µs |
-| CCM latency overhead (cold, single-shot) | 39.6 µs (1.08%) | 35.7 µs (1.74%) |
-| CCM per-call cost (hot cache, amplified) | 7.57 µs | 7.57 µs (64-d, identical) |
-| CCM energy overhead | 3.03 µJ (0.18% of 1.72 mJ/inference) | (identical, 64-d) |
-| Device == host | 99.0% (N=512, full set) | 100% (N=128) |
+| On-device CCM AUROC / TPR@1% (523 clean + 286 triggered) | 0.988 / 0.934 | 0.997 / 0.913 |
+| Device == host (FP32 and ESP-PPQ simulation) | 100% (523/523) | 100% (523/523) |
+| Feature codes bit-exact with the host simulation | 809/809 | 809/809 |
+| Inference latency (single / dual core) | 3669.8 / 3652 µs | 1969.2 / 1974 µs |
+| End-to-end, cold (inference + feature read + 1x CCM) | 3728.8 µs | 2043.5 µs |
+| CCM overhead, cold (the deployed cost) | 58.9 µs (1.61%) | 74.2 µs (3.77%) |
+| CCM per call, hot cache (lower bound only) | 7.75 µs | 7.83 µs |
+| Model RAM (internal / PSRAM) | 6.6 / 41.9 KB | 7.3 / 37.8 KB |
+| CCM energy, cold (estimate: latency x 463 mW) | ~27 µJ (1.6%) | ~34 µJ (3.8%) |
 
-Board power at 240 MHz: 132.1 mW idle, 463.1 mW during inference (Nordic PPK2, 3.3 V).
+Board power at 240 MHz: 132.1 mW idle, 463.1 mW during inference (Nordic PPK2, 3.3 V). On the previous
+image the PPK2 trace gives a *measured* cold-path monitor energy of 16.9 µJ (0.98%) per inference
+(`code/energy_reanalyze_r2.py`); the 3.03 µJ reported in an earlier version was the hot-cache figure.
 
 Neither construction achieves INT8 conditioning for either architecture on any of the three datasets;
-the CCM is a near-free on-device monitor, and its detection advantage over a global statistic depends
-on the setting — and, as the revision found, on how the calibration set is drawn (see below).
+the CCM costs a few percent of an inference on the deployed (cold) path, and its detection advantage
+over a global statistic depends on the setting and on how the calibration set is drawn (see above).
+At a 1% false-alarm budget under a recording-level split it detects 0.19-0.60 of triggered inputs, and
+it alarms on operating conditions absent from its calibration data as readily as on a trigger.
 
 ## Citation
 

@@ -74,9 +74,11 @@ def tab_baselines():
 the 3 attacks $\times$ 4 trigger designs $\times$ 3 seeds; higher is better). TPR@1\% is the detection
 rate at a $1\%$ false-alarm budget, the operating point that matters for a device that classifies
 continuously. Cost is the on-MCU footprint: stored 32-bit parameters and multiply--adds per inference
-(class count $C{=}4$ for CWRU). The one-class $k$NN is the only baseline that approaches CCM on
-accuracy, and it stores the full calibration bank---$\approx$64$\times$ more memory (512 vs.\
-32{,}768 floats).}
+(class count $C{=}4$ for CWRU). Every class-conditional statistic detects these backdoors and the two
+that are not class-conditional do not; within that group CCM is not the most accurate---the one-class
+$k$NN and diagonal Mahalanobis are ahead of it on clean calibration data, and the $k$NN stores the
+full calibration bank, $\approx$64$\times$ more memory (32{,}768 vs.\ 512 floats). CCM's advantage
+appears only under a contaminated calibration set (Table~\ref{tab:poison}).}
 \label{tab:baselines}
 \small\setlength{\tabcolsep}{5pt}
 \begin{tabular}{lccccrr}
@@ -201,41 +203,44 @@ Calib.\ poison & CCM & Centroid & Maha. & $k$NN & CCM & Centroid & Maha. & $k$NN
 
 # ---------------------------------------------------------------- Table: CCM vs global significance
 def tab_stats():
-    st = json.load(open(os.path.join(RES, "stats_ccm_vs_global.json")))
-    order = {"dataset=cwru": "CWRU", "dataset=mfpt": "MFPT", "ALL settings": "All (pooled)"}
-    tpr = {s["label"]: s for s in st if s.get("metric") == "TPR@1%"}
-    def fmt_p(w):
-        if not w or "p=" not in w:
-            return "--"
-        val = float(w.split("p=")[1])
+    # settings-level analysis (stats.py): one paired value per setting, hierarchical bootstrap
+    st = json.load(open(os.path.join(RES, "stats_ccm_vs_global_settings.json")))
+    order = {"dataset=cwru": "CWRU", "dataset=mfpt": "MFPT", "ALL settings": "All"}
+    def fmt_p(val):
         m, e = f"{val:.0e}".split("e")
         return f"${m}\\!\\times\\!10^{{{int(e)}}}$"
+    def fmt_w(w):
+        return fmt_p(float(w.split("p=")[1])) if w and "p=" in w else "--"
+    def fmt_pb(p):   # bootstrap p is resolution-limited at 1/(iters+1)
+        return r"$<\!10^{-3}$" if p < 1e-3 else f"${p:.3f}$"
+    tpr = {s["label"]: s for s in st if s["metric"] == "TPR@1%"}
     rows = []
-    for s in st:
-        if s["label"] not in order or s.get("metric", "AUROC") != "AUROC":
-            continue
-        lo, hi = s["ci95"]
-        p = fmt_p(s["wilcoxon"])
-        t = tpr.get(s["label"])
-        tcol = (f"${t['mean_diff']:+.3f}$" if t else "--")
-        rows.append(f"{order[s['label']]} & {s['ccm_mean']:.3f} & {s['global_mean']:.3f} & "
-                    f"${s['mean_diff']:+.3f}$ & $[{lo:+.3f}, {hi:+.3f}]$ & {p} & {tcol} \\\\")
-    # CWRU, MFPT, All order
+    for lab in ("dataset=cwru", "dataset=mfpt", "ALL settings"):
+        s = next(x for x in st if x["label"] == lab and x["metric"] == "AUROC")
+        t = tpr[lab]
+        lo, hi = s["ci95"]; tlo, thi = t["ci95"]
+        rows.append(f"{order[lab]} ({s['n_settings']}) & {s['ccm_mean']:.3f} & {s['global_mean']:.3f} & "
+                    f"${s['mean_diff']:+.3f}$ & $[{lo:+.3f}, {hi:+.3f}]$ & {fmt_w(s['wilcoxon'])} & "
+                    f"${t['mean_diff']:+.3f}$ & $[{tlo:+.3f}, {thi:+.3f}]$ \\\\")
     body = r"""\begin{table}[tbp]\centering
-\caption{Class-conditional CCM vs.\ the global ablation: paired difference in detection AUROC pooled
-across settings and seeds, with a 95\% bootstrap CI and a paired Wilcoxon signed-rank test. The last
-column repeats the paired difference at the $1\%$ false-alarm operating point.}
+\caption{Class-conditional CCM vs.\ the global ablation, with the \emph{setting} as the unit of
+replication (in parentheses: number of dataset $\times$ model $\times$ trigger $\times$ attack
+settings). $\Delta$ is the mean paired difference over settings, each setting averaged over its seeds;
+the 95\% CI is a two-stage hierarchical bootstrap (settings resampled, then seeds within each
+setting); the Wilcoxon signed-rank test is over the per-setting means. The last two columns repeat
+the comparison at the $1\%$ false-alarm operating point.}
 \label{tab:stats}
-\small\setlength{\tabcolsep}{5pt}
-\begin{tabular}{lcccccc}
+\small\setlength{\tabcolsep}{3.5pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lccccccc}
 \toprule
- & \multicolumn{5}{c}{AUROC} & TPR@1\% \\
-\cmidrule(lr){2-6}\cmidrule(lr){7-7}
-Stratum & CCM & Global & $\Delta$ & 95\% CI & Wilcoxon $p$ & $\Delta$ \\
+ & \multicolumn{5}{c}{AUROC} & \multicolumn{2}{c}{TPR@1\%} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-8}
+Stratum & CCM & Global & $\Delta$ & 95\% CI & Wilcoxon $p$ & $\Delta$ & 95\% CI \\
 \midrule
 """ + "\n".join(rows) + r"""
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{table}"""
     _w("tab_stats.tex", body)
 
@@ -417,39 +422,102 @@ Model & Data & Attack & CCM & glob. & CCM & glob. & CCM & glob. & CCM & glob. \\
 
 # ------------------------------------------------- Table: recording-level split
 def tab_recsplit():
+    """Window vs recording-level split, CWRU and MFPT (R3 / R4). Monitor columns are for the static
+    INT8 backdoor (the base deployable attack), at both AUROC and the 1% false-alarm point (R4.7)."""
     rows = []
-    for model in ("vibcnn", "wdcnn"):
-        f = os.path.join(RES, "recording_split", f"exp_cwru_{model}", "summary.json")
-        if not os.path.exists(f):
-            continue
-        rec = {r["attack"]: r for r in json.load(open(f))["table"]}
-        win = _head("cwru", model)
-        label = {"vibcnn": "VibCNN", "wdcnn": "WDCNN"}[model]
-        for split, tab in (("window", win), ("recording", rec)):
-            q, pq = tab["qcb"], tab["pq"]
-            rows.append(f"{label} & {split} & {q['clean']:.2f} & {q['asr_int']:.2f} & "
-                        f"{q['asr_fp']:.2f} & {pq['asr_int']:.2f} & {pq['asr_fp']:.2f} & "
-                        f"{tab['static']['auroc_cc']:.2f} \\\\")
+    for ds in ("cwru", "mfpt"):
+        for model in ("vibcnn", "wdcnn"):
+            f = os.path.join(RES, "recording_split", f"exp_{ds}_{model}", "summary.json")
+            if not os.path.exists(f):
+                continue
+            rec = {r["attack"]: r for r in json.load(open(f))["table"]}
+            win = _head(ds, model)
+            label = {"vibcnn": "VibCNN", "wdcnn": "WDCNN"}[model]
+            for split, tab in (("window", win), ("recording", rec)):
+                q, pq, st = tab["qcb"], tab["pq"], tab["static"]
+                rows.append(f"{ds.upper()} & {label} & {split} & {st['clean']:.2f} & "
+                            f"{q['asr_int']:.2f} & {q['asr_fp']:.2f} & {pq['asr_int']:.2f} & "
+                            f"{pq['asr_fp']:.2f} & {st['auroc_cc']:.2f} & {st['tpr1']:.2f} \\\\")
+            if ds == "cwru" and model == "wdcnn":
+                rows.append(r"\midrule")
+    if rows and rows[-1] == r"\midrule":
+        rows.pop()
     body = r"""\begin{table}[tbp]\centering
-\caption{The bit-width result and the monitor under a stricter split (CWRU, mean over 5 seeds).
+\caption{The bit-width result and the monitor under a stricter split (mean over 5 seeds).
 ``window'' splits non-overlapping windows at random; ``recording'' holds out whole recordings, and
-therefore whole motor loads, so no test window shares a recording with any training window.}
+therefore whole operating conditions, so no test window shares a recording with any training window.
+Clean accuracy and the monitor columns are for the static INT8 backdoor; TPR@1\% is the detection rate
+at a $1\%$ false-alarm budget, the operating point a deployer should plan against.}
 \label{tab:recsplit}
-\small\setlength{\tabcolsep}{5pt}
-\begin{tabular}{llccccc c}
+\small\setlength{\tabcolsep}{3.5pt}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lllccccccc}
 \toprule
- & & \multicolumn{3}{c}{bin-proj@INT4} & \multicolumn{2}{c}{joint-opt@INT8} & CCM \\
-\cmidrule(lr){3-5}\cmidrule(lr){6-7}
-Model & Split & Clean & ASR$_\text{INT4}$ & ASR$_\text{FP32}$ & ASR$_\text{INT8}$ & ASR$_\text{FP32}$ & AUROC \\
+ & & & & \multicolumn{2}{c}{bin-proj@INT4} & \multicolumn{2}{c}{joint-opt@INT8} & \multicolumn{2}{c}{CCM} \\
+\cmidrule(lr){5-6}\cmidrule(lr){7-8}\cmidrule(lr){9-10}
+Data & Model & Split & Clean & ASR$_\text{INT4}$ & ASR$_\text{FP32}$ & ASR$_\text{INT8}$ & ASR$_\text{FP32}$ & AUROC & TPR@1\% \\
+\midrule
+""" + "\n".join(rows) + r"""
+\bottomrule
+\end{tabular}}
+\end{table}"""
+    _w("tab_recsplit.tex", body)
+
+
+# ------------------------------------------------- Table: k-of-N alarm aggregation (R4.4)
+def tab_aggregation():
+    rows = []
+    for ds in ("cwru", "mfpt"):
+        for model in ("vibcnn", "wdcnn"):
+            f = os.path.join(RES, "alarm_aggregation", f"agg_{ds}_{model}.json")
+            if not os.path.exists(f):
+                continue
+            d = json.load(open(f))
+            label = {"vibcnn": "VibCNN", "wdcnn": "WDCNN"}[model]
+            first = True
+            for key in ("1/1", "2/3", "3/5", "5/10"):
+                r = d["table"][key]
+                ev = r["benign_events_total"]
+                rate = (f"{r['events_per_hour_signal_pooled']:.0f}" if ev else
+                        f"$<${r['events_per_hour_signal_ub95']:.0f}")
+                lead = (f"{ds.upper()} & {label} & " if first else " & & ")
+                first = False
+                rows.append(lead + f"{key.replace('/', '-of-')} & {ev} & {rate} & "
+                            f"{100*r['frac_time_escalated']:.1f}\\% & "
+                            f"{r['median_delay_ms_signal']:.0f} & {r['p_detect_within']['20']:.2f} \\\\")
+            rows.append(r"\midrule")
+    if rows:
+        rows.pop()
+    exp = {ds: json.load(open(os.path.join(RES, "alarm_aggregation", f"agg_{ds}_vibcnn.json")))
+           for ds in ("cwru", "mfpt")}
+    body = r"""\begin{table}[tbp]\centering
+\caption{Aggregating per-window alarms ($k$ of the last $N$ windows must fire) on time-ordered
+held-out recordings (recording-level split, static INT8 backdoor, 1\% per-window calibration budget,
+5 seeds). Benign: escalation events on clean streams, as a count and per hour of signal
+(""" + f"{exp['cwru']['rate_signal']:.1f}" + r""" windows/s on CWRU, """ + f"{exp['mfpt']['rate_signal']:.1f}" + r""" on MFPT;
+exposure """ + f"{exp['cwru']['table']['1/1']['benign_exposure_s']:.0f}" + r"""\,s and """ + f"{exp['mfpt']['table']['1/1']['benign_exposure_s']:.0f}" + r"""\,s of signal; a zero count is shown as
+its exact 95\% Poisson upper bound), and the fraction of time spent escalated. Attack: a persistent
+trigger starting at every possible onset in every non-target recording; the probability of escalating
+within 20 windows (onsets never caught count as misses), and the median delay to the first escalation
+among the onsets that are caught---a conditional figure, which is why it can fall as the rule
+tightens and fewer, faster-caught onsets remain.}
+\label{tab:aggregation}
+\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lllrrrrr}
+\toprule
+ & & & \multicolumn{3}{c}{benign} & \multicolumn{2}{c}{triggered} \\
+\cmidrule(lr){4-6}\cmidrule(lr){7-8}
+Data & Model & rule & events & per hour & time esc. & delay (ms) & P($\le$20) \\
 \midrule
 """ + "\n".join(rows) + r"""
 \bottomrule
 \end{tabular}
 \end{table}"""
-    _w("tab_recsplit.tex", body)
+    _w("tab_aggregation.tex", body)
 
 
 if __name__ == "__main__":
+    tab_aggregation()
     tab_baselines(); tab_crossdomain(); tab_adaptive(); tab_poison(); tab_stats(); tab_triggers()
     tab_hyperparams(); tab_gendetect(); tab_far(); tab_calibdraw(); tab_recsplit()
     print("done -> paper/tables/")

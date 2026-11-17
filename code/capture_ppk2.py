@@ -7,11 +7,11 @@ voltage and samples current at 100 ksps. The firmware (qsentry_bench.cpp) runs i
 measurement loop ONCE at boot and then idles, so we power-cycle the DUT (toggle_DUT_power OFF->ON)
 at the start of the capture to guarantee the inference / amplified-monitor humps land inside the
 window. The resulting CSV (Timestamp(ms),Current(uA)) is consumed by compute_energy.py, which
-segments the trace into inference vs amplified humps by duration (logic markers not required).
+segments the trace into regions A / E2E / B (and uses the D0-D2 logic markers when recorded).
 
 Usage:
     conda activate qsentry
-    python code/capture_ppk2.py --out results/energy/ppk2.csv --voltage 3300 --seconds 95
+    python code/capture_ppk2.py --out results/energy/ppk2_r3.csv --voltage 3300 --seconds 240
 """
 import argparse, time, sys
 import numpy as np
@@ -34,7 +34,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/energy/ppk2.csv")
     ap.add_argument("--voltage", type=int, default=3300, help="source voltage in mV")
-    ap.add_argument("--seconds", type=float, default=95.0)
+    ap.add_argument("--seconds", type=float, default=240.0,
+                    help="revision-3 firmware: ~35 s detection phase + 5 s idle + ~155 s energy rounds")
     ap.add_argument("--no-cycle", action="store_true", help="do not power-cycle the DUT at start")
     a = ap.parse_args()
 
@@ -51,14 +52,16 @@ def main():
     ppk2.toggle_DUT_power("ON")               # t~=0: board boots and runs the measurement loop
     print(f"DUT powered on; capturing {a.seconds:.0f} s ...")
 
-    samples = []
+    samples, logic = [], []          # logic: one D0..D7 byte per sample, when the API provides it
     t0 = time.time()
     last = t0
     while time.time() - t0 < a.seconds:
         buf = ppk2.get_data()
         if buf:
-            s, _ = ppk2.get_samples(buf)
+            s, dig = ppk2.get_samples(buf)
             samples.extend(s)
+            if dig is not None and len(dig) == len(s):
+                logic.extend(int(v) & 0xFF for v in dig)
         else:
             time.sleep(0.001)
         now = time.time()
@@ -83,13 +86,19 @@ def main():
           f"overall I: min={cur.min():.0f} max={cur.max():.0f} mean={cur.mean():.0f} uA")
 
     t = np.arange(n, dtype=np.float64) * dt_ms
+    has_logic = len(logic) == n
+    print(f"logic channels: {'recorded (D0..D7)' if has_logic else 'not available -> current only'}")
+    bitstr = [format(v, "08b")[::-1] for v in range(256)]   # D0 first, as in the PPK2 app export
     with open(a.out, "w") as f:
-        f.write("Timestamp(ms),Current(uA)\n")
+        f.write("Timestamp(ms),Current(uA)" + (",D0-D7" if has_logic else "") + "\n")
         CH = 1_000_000
         for i in range(0, n, CH):
             j = min(i + CH, n)
             tt, cc = t[i:j], cur[i:j]
-            f.write("\n".join(f"{tt[k]:.2f},{cc[k]:.3f}" for k in range(len(tt))))
+            if has_logic:
+                f.write("\n".join(f"{tt[k]:.2f},{cc[k]:.3f},{bitstr[logic[i + k]]}" for k in range(len(tt))))
+            else:
+                f.write("\n".join(f"{tt[k]:.2f},{cc[k]:.3f}" for k in range(len(tt))))
             f.write("\n")
     print(f"wrote {a.out}")
 

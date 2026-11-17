@@ -77,10 +77,69 @@ def summarize(rows, label, key=("ccm", "global"), metric="AUROC"):
             "wilcoxon": w}
 
 
+def hier_boot(rows, key, iters=10000, seed=0):
+    """Two-stage (hierarchical) bootstrap of the mean paired difference: resample SETTINGS with
+    replacement, then resample SEEDS within each drawn setting. Seeds of one setting share a model
+    family, a dataset and a trigger, so they are not independent draws (R4, minor revision 2); this
+    keeps the setting as the unit of replication. Returns (mean, lo, hi, p_two_sided)."""
+    rng = np.random.default_rng(seed)
+    diffs = [r[key[0]] - r[key[1]] for r in rows if len(r[key[0]])]
+    S = len(diffs)
+    means = np.empty(iters)
+    for b in range(iters):
+        pick = rng.integers(0, S, S)
+        means[b] = np.mean([diffs[i][rng.integers(0, len(diffs[i]), len(diffs[i]))].mean()
+                            for i in pick])
+    obs = float(np.mean([d.mean() for d in diffs]))
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    # two-sided bootstrap p for H0: mean diff = 0 (bootstrap distribution shifted to the null);
+    # resolution is bounded by 1/(iters+1)
+    null = means - means.mean()
+    p = float((np.sum(np.abs(null) >= abs(obs)) + 1) / (iters + 1))
+    return obs, float(lo), float(hi), p
+
+
+def summarize_settings(rows, label, key=("ccm", "global"), metric="AUROC"):
+    """Settings-level analysis: one paired value per setting (seed-averaged), Wilcoxon over settings,
+    plus the hierarchical bootstrap CI. This is what the paper reports (Table tab:stats)."""
+    rows = [r for r in rows if len(r[key[0]])]
+    if not rows:
+        return None
+    a = np.array([r[key[0]].mean() for r in rows]); g = np.array([r[key[1]].mean() for r in rows])
+    d = a - g
+    w = ""
+    if wilcoxon is not None and len(d) >= 6 and np.any(d != 0):
+        try:
+            _, p_w = wilcoxon(a, g); w = f"Wilcoxon p={p_w:.2e}"
+        except Exception as e:
+            w = f"Wilcoxon n/a ({type(e).__name__})"
+    obs, lo, hi, p_b = hier_boot(rows, key)
+    print(f"\n[{label}]  SETTINGS-LEVEL  metric={metric}  n_settings={len(rows)}")
+    print(f"  CCM {a.mean():.3f}  global {g.mean():.3f}  diff {obs:+.3f}  "
+          f"hier-bootstrap 95% CI [{lo:+.3f}, {hi:+.3f}]  p_boot={p_b:.1e}  {w}"
+          f"  CCM>global in {np.mean(d > 0)*100:.0f}% of settings")
+    return {"label": label, "metric": metric, "level": "settings", "n_settings": len(rows),
+            "ccm_mean": round(float(a.mean()), 4), "global_mean": round(float(g.mean()), 4),
+            "mean_diff": round(obs, 4), "ci95": [round(lo, 4), round(hi, 4)],
+            "p_boot": p_b, "wilcoxon": w, "frac_ccm_gt_global": round(float(np.mean(d > 0)), 3)}
+
+
 def main():
     rows = collect()
     if not rows:
         print("No baseline JSONs found in results/baselines/. Run eval_baselines.py first."); return
+    # settings-level (reported): one paired value per setting, hierarchical bootstrap over seeds
+    sl = []
+    for metric, key in (("AUROC", ("ccm", "global")), ("TPR@1%", ("ccm_tpr1", "global_tpr1"))):
+        sl.append(summarize_settings(rows, "ALL settings", key, metric))
+        for ds in sorted(set(r["dataset"] for r in rows)):
+            sl.append(summarize_settings([r for r in rows if r["dataset"] == ds],
+                                         f"dataset={ds}", key, metric))
+    outp = os.path.join(BASE, "..", "stats_ccm_vs_global_settings.json")
+    json.dump([x for x in sl if x], open(outp, "w"), indent=2)
+    print(f"\nSaved settings-level -> {os.path.abspath(outp)}")
+    print("\n# ---- previous seed-pooled analysis (kept for the response letter; treats seeds as "
+          "independent, which overstates certainty) ----")
     out = [x for x in [summarize(rows, "ALL settings")] if x]
     for ds in sorted(set(r["dataset"] for r in rows)):
         out.append(summarize([r for r in rows if r["dataset"] == ds], f"dataset={ds}"))
